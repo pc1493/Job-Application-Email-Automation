@@ -18,7 +18,10 @@ RUN npm install -g @anthropic-ai/claude-code
 RUN useradd -m claude-user
 WORKDIR /workspace
 RUN chown -R claude-user:claude-user /workspace
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
 
 USER claude-user
 
+ENTRYPOINT ["/entrypoint.sh"]
 CMD ["claude"]
