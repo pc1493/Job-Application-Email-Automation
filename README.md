@@ -60,3 +60,4 @@ python3 -c "import duckdb; con = duckdb.connect('data/emails.duckdb'); print(con
 | 2 | Planned | Incremental daily fetch |
 | 3 | Planned | QA hooks, edge case refinement |
 | 4 | Stretch | Stage detection (interview rounds, offers) |
+# Job-Application-Email-Automation
