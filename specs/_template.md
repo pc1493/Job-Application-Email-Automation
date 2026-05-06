@@ -28,6 +28,7 @@ Specific, ordered actions.
 Not "build the model" — "create stg_X.sql materializing as view, selecting fields A, B, C from source S, applying filter F."
 Each step should be small enough that you can predict the output before running it.
 
+
 Output
 Exact file(s) to create or modify.
 Expected format / schema / signature.
@@ -37,6 +38,7 @@ Acceptance criteria
 [ ] Edge cases explicitly named.
 [ ] Error behavior defined.
 [ ] Lint / type-check / tests pass (specify which).
+[ ] Verification: run @~/.claude/_verification.md before commit
 
 Out of scope
 Explicitly exclude things the agent might "helpfully" add.
