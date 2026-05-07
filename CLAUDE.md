@@ -36,5 +36,11 @@ Currently in Phase 1.
 - Calendar integration beyond parsing invite content.
 - Auto-replying to emails. Read-only pipeline.
 
+## Running tests
+```
+pytest tests/ -v
+```
+`pytest.ini` sets `pythonpath = .` so no `PYTHONPATH` prefix is needed.
+
 ## Active task
-See `specs/` directory. Current task: none yet — project setup complete.
+See `specs/` directory. Spec 02 (Gmail fetcher) complete. Next: spec 03 (classifier).
