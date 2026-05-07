@@ -1,196 +1,330 @@
-# Project Context — Job Application Email Automation
+# Architectural Decisions
 
-_Generated 2026-05-05. Pass this file to Opus when writing specs 02 and 03._
+Append-only log of architectural decisions for this project. Each entry is
+immutable — if a decision changes, write a new entry that supersedes the old one.
+Do not edit history.
 
----
+Format: numbered entries, newest at the bottom. Reference other entries by
+number (e.g. "see #003"). Reference from specs the same way.
 
-## What this project is
-
-A Python pipeline that reads Gmail, classifies job-application emails using the
-Claude API, and writes structured records to a local DuckDB database. Read-only
-against Gmail. No web UI — SQL queries are the interface.
-
-**User:** Peter Chen — peterchen.ba@gmail.com  
-**Phase now:** Phase 1 (historical fetch + classify + store, manual verification)
+Not for: commit-message-level trivia, renames, formatting choices. Only for
+decisions where the *why* would be unclear from the code alone.
 
 ---
 
-## Stack
+## Index
 
-| Component | Library / Tool | Notes |
-|---|---|---|
-| Language | Python 3.11 | Runs inside Docker (node:20 base) |
-| Gmail read | google-api-python-client + google-auth-oauthlib | OAuth2 credentials in `creds/` (gitignored) |
-| LLM classification | Anthropic Python SDK (`anthropic>=0.25.0`) | Model: Claude Sonnet 4. Key in `.env` as `ANTHROPIC_API_KEY` |
-| Storage | DuckDB (`duckdb>=0.10.0`) | Local file at `data/emails.duckdb` (gitignored) |
-| Env vars | python-dotenv | `.env` at project root (gitignored) |
-| Tests | pytest (not in requirements.txt yet — was used, assumed available) | `tmp_path` fixture for all DB tests |
-| Container | Docker, node:20 base + Python 3.11, Claude Code CLI installed | `build.ps1` / `run.ps1` for Windows host |
+- #001 — DuckDB as local storage layer
+- #002 — Gmail message ID as primary key on `job_emails`
+- #003 — Two-table schema: `job_emails` + `job_threads`
+- #004 — Confidence score convention (NULL / 0–1.0 / 1.0)
+- #005 — 0.85 confidence threshold for auto-classification
+- #006 — Never log raw email bodies
+- #007 — Read-only Gmail access (`gmail.readonly` scope)
+- #008 — Claude Haiku 4.5 as classifier, with Sonnet escalation hatch
+- #009 — `classification_method` enum splits regex / heuristic / llm_single / llm_thread / manual
+- #010 — Dumb fetch + classifier filter (fetcher does not judge job-relatedness)
+- #011 — Two-stage classification: Python heuristics, then Haiku LLM on the remainder
 
 ---
 
-## What is already built (Spec 01 — complete)
+## #001 — DuckDB as local storage layer
 
-### `pipeline/schema.sql`
-DDL for two tables and three ENUM types:
+**Date:** 2026-XX-XX (TODO: Peter, fill in from Opus chat history)
+**Status:** Active
 
-**ENUMs:**
-- `stage_enum`: applied, screening, interview_1, interview_2, interview_3, offer, rejection, recruiter_outreach, ghosted
-- `outcome_enum`: pending, rejected, offer_received, offer_accepted, offer_declined, withdrew, ghosted
-- `classification_method_enum`: regex, heuristic, llm_single, llm_thread, manual
+**Decision:** Use DuckDB as the storage engine. Local file at `data/emails.duckdb`,
+gitignored. No server, no shared database.
 
-**`job_emails` table** — one row per email:
+**Rationale:** Single-file, no server, embedded in Python — matches Phase 1
+requirement of local-only single-user operation. Postgres was implicitly
+considered and rejected as overkill (no concurrent access needed, no remote
+deployment planned). Choice was made on intuition rather than benchmarked
+alternatives. Revisit if Phase 2 ever needs multi-user access or remote DB.
 
-| Column | Type | Notes |
-|---|---|---|
-| email_id | TEXT PK | Gmail message ID |
-| thread_id | TEXT NOT NULL | Gmail thread ID |
-| company | TEXT | Extracted by classifier |
-| role | TEXT | Extracted by classifier |
-| stage | stage_enum | Classified stage |
-| outreach_type | TEXT | Free text (e.g. "inbound recruiter") |
-| is_spam | BOOLEAN DEFAULT FALSE | |
-| is_recruiter_inbound | BOOLEAN DEFAULT FALSE | |
-| received_date | TIMESTAMP NOT NULL | |
-| subject | TEXT | |
-| sender | TEXT NOT NULL | |
-| calendar_invite_detected | BOOLEAN DEFAULT FALSE | |
-| confidence_score | DECIMAL(3,2) | NULL=unclassified; 1.0=regex; 0–1.0=LLM self-reported |
-| classification_method | classification_method_enum | |
-| raw_content | TEXT | Do NOT log to stdout/files |
-| extracted_data | JSON | LLM structured output |
-| processed_at | TIMESTAMP DEFAULT CURRENT_TIMESTAMP | |
-| last_reclassified_at | TIMESTAMP NULL | |
+**Implications:**
+- Schema lives in `pipeline/schema.sql` as the source of truth.
+- All queries go through `pipeline/db.py` helpers.
+- Migrating to Postgres later (if Phase 2 ever needs multi-user access) means
+  rewriting connection handling but the SQL itself is mostly portable.
 
-**`job_threads` table** — one row per Gmail thread (aggregated view):
+---
 
-| Column | Type | Notes |
-|---|---|---|
-| thread_id | TEXT PK | |
-| company | TEXT | |
-| role | TEXT | |
-| current_stage | stage_enum | Latest stage in thread |
-| stage_history | JSON | Ordered list of stage transitions |
-| first_contact | TIMESTAMP | |
-| last_contact | TIMESTAMP | |
-| is_active | BOOLEAN DEFAULT TRUE | |
-| total_emails | INTEGER DEFAULT 0 | |
-| outcome | outcome_enum DEFAULT 'pending' | |
+## #002 — Gmail message ID as primary key on `job_emails`
 
-### `pipeline/db.py`
-Three public symbols:
+**Date:** 2026-XX-XX (during spec 01)
+**Status:** Active
 
-```python
-def get_connection(db_path) -> duckdb.DuckDBPyConnection
-def init_schema(conn) -> None          # reads schema.sql, idempotent
-@contextmanager def connection(db_path) # yields conn, guarantees close
-```
+**Decision:** `job_emails.email_id` (TEXT, Gmail message ID) is the primary key.
 
-`confidence_score` convention (from module docstring):
-- `1.0` — regex/deterministic (exact match, no uncertainty)
-- `0–1.0` — LLM classification (model's self-reported confidence)
+**Rationale:** The fetcher is designed to be re-run (historical backfill, then
+incremental updates). Using Gmail's own immutable message ID as the PK makes
+inserts idempotent automatically — re-fetching the same message produces a
+PK conflict, which we handle as "already seen, skip." No deduplication logic
+needed.
+
+**Implications:**
+- Insert pattern is `INSERT … ON CONFLICT DO NOTHING` (or equivalent).
+- We never generate our own surrogate IDs for emails.
+- If a Gmail message is deleted on Gmail's side, our row persists. That's a
+  feature (audit trail), not a bug.
+
+---
+
+## #003 — Two-table schema: `job_emails` + `job_threads`
+
+**Date:** 2026-XX-XX (TODO: Peter, fill in from Opus chat history)
+**Status:** Active
+
+**Decision:** Schema has two tables: `job_emails` (one row per email) and
+`job_threads` (one row per Gmail thread, aggregated rollup).
+
+**Rationale:** One row per email preserves raw evidence for re-classification
+if prompts or logic change. One row per thread provides the natural query
+unit for application lifecycle (current stage, outcome). A single wide table
+was implicitly considered and rejected because thread-level aggregates would
+need recomputation on every query. Choice was made on design intuition rather
+than load-tested alternatives. Revisit if thread rollup logic becomes a
+bottleneck or if the duplication between tables creates consistency bugs.
+
+**Implications:**
+- `job_threads` is derived from `job_emails`. It must be re-derivable from
+  scratch if logic changes.
+- Thread rollup logic is its own concern (likely a later spec).
+- Queries about "how is application X going" hit `job_threads`. Queries
+  about "what did the recruiter say in email Y" hit `job_emails`.
+
+---
+
+## #004 — Confidence score convention (NULL / 0–1.0 / 1.0)
+
+**Date:** 2026-XX-XX (during spec 01)
+**Status:** Active
+
+**Decision:** `job_emails.confidence_score` follows three states:
 - `NULL` — not yet classified
+- `1.0` — deterministic match (regex / exact rule), no uncertainty
+- `0–1.0` — LLM classification, model's self-reported confidence
 
-### `tests/test_schema.py`
-9 passing pytest tests covering: table existence, enum existence, idempotency,
-exact column/type sets for both tables, PK violations, invalid enum rejection,
-outcome default.
+**Rationale:** Three states cleanly separate "no attempt yet" from "tried and
+got a noisy answer" from "tried and got a certain answer." `NULL` is critical:
+it lets the orchestrator find unclassified rows with `WHERE confidence_score
+IS NULL` rather than needing a separate `is_classified` flag.
 
----
-
-## What does NOT exist yet
-
-- `pipeline/fetcher.py` — Gmail API fetch (Spec 02)
-- `pipeline/classifier.py` — Claude API classification (Spec 03)
-- `pipeline/orchestrator.py` — wires fetcher → classifier → DB write (likely Spec 04 or 05)
-- Any `.env` or `creds/` content (user-managed, gitignored)
-- `data/emails.duckdb` (runtime artifact, gitignored)
-- Thread-level aggregation logic
+**Implications:**
+- Re-classification is signaled by `last_reclassified_at`, not by setting
+  confidence back to NULL.
+- A row can move from NULL → some value, but never back to NULL.
 
 ---
 
-## Key constraints for all future specs
+## #005 — 0.85 confidence threshold for auto-classification
 
-1. **Never log raw email bodies** to stdout or files. Personal data.
-2. **Confidence threshold:** auto-classify at ≥ 0.85; below that, flag for human review (leave `classification_method = NULL` or set a `needs_review` flag — TBD in spec).
-3. **API key:** `ANTHROPIC_API_KEY` from `.env` only. Never hardcode.
-4. **No new dependencies** without explicit spec approval. Current `requirements.txt`:
-   - anthropic>=0.25.0
-   - google-api-python-client>=2.120.0
-   - google-auth-oauthlib>=1.2.0
-   - google-auth-httplib2>=0.2.0
-   - duckdb>=0.10.0
-   - python-dotenv>=1.0.0
-5. **pytest** is not in requirements.txt but is assumed available (installed separately in the container).
-6. **DB path** at runtime: `data/emails.duckdb`. Tests always use `tmp_path`.
-7. **Idempotent inserts** — the fetcher will be re-run; it must not duplicate rows. `email_id` is the Gmail message ID and the PK.
-8. **Docker / POSIX paths only** — no Windows paths in generated code.
+**Date:** 2026-XX-XX (TODO: Peter, fill in from Opus chat history)
+**Status:** Active
 
----
+**Decision:** Classifications with `confidence_score >= 0.85` are accepted
+automatically. Below 0.85 requires human review.
 
-## Project file tree (relevant files only)
+**Rationale:** Chosen as initial heuristic without sample-data calibration —
+0.85 felt high enough to filter low-confidence noise but not so high that it
+flags everything for review. Alternatives (0.8, 0.9) were not tested.
+Acceptable starting point because consequences of misclassification in
+Phase 1 are low (manual review, not user-facing action). Revisit after the
+first ~100 classified emails are manually reviewed: if false positives at
+≥0.85 are common, raise the threshold; if too many obvious-correct rows fall
+below 0.85, lower it.
 
-```
-/workspace/
-├── CLAUDE.md                    # Project rules (read this first)
-├── DECISIONS.md                 # This file
-├── requirements.txt             # Python deps (see above)
-├── Dockerfile                   # node:20 + Python 3.11 + Claude Code CLI
-├── entrypoint.sh                # Sets git config, optionally loads GITHUB_TOKEN
-├── build.ps1 / run.ps1          # Windows host scripts to build/run Docker
-├── .claude/settings.json        # {"permissions": {"defaultMode": "bypassPermissions"}}
-├── pipeline/
-│   ├── schema.sql               # DuckDB DDL — source of truth for schema
-│   └── db.py                    # get_connection, init_schema, connection()
-├── specs/
-│   ├── _template.md             # Standard spec template
-│   └── 01-duckdb-schema.md      # Spec 01 (complete)
-├── tests/
-│   └── test_schema.py           # 9 passing tests for schema/db
-├── data/                        # gitignored — runtime DB lives here
-├── logs/                        # gitignored — future event logs
-└── creds/                       # gitignored — OAuth2 credentials
-```
+**Implications:**
+- The classifier (spec 03) must produce a confidence value the LLM is
+  prompted to self-report.
+- "Below threshold" handling needs a flag or workflow — TBD in spec 03
+  (whether to leave `classification_method = NULL`, add a `needs_review`
+  column, or some other approach).
+- This threshold may need tuning after Phase 1 sees real data.
 
 ---
 
-## Likely shape of Spec 02 (Gmail fetcher)
+## #006 — Never log raw email bodies
 
-Goal: fetch historical emails from Gmail, write raw metadata + body to `job_emails`.
+**Date:** 2026-XX-XX (during spec 01)
+**Status:** Active
 
-Key decisions to resolve in spec:
-- **Search query:** what Gmail search string identifies job-application emails? (e.g. label-based, keyword-based, or broad + classifier-filters-later)
-- **Fetch scope:** how far back historically? All mail, or a date range?
-- **Fields to pull from Gmail API:** `id`, `threadId`, `payload.headers` (From, Subject, Date), `payload.body` or `snippet`
-- **Partial body extraction:** full body vs. snippet — impacts classifier quality
-- **Upsert vs. skip on duplicate:** email_id PK exists; insert-or-ignore is the safe default
-- **OAuth flow:** credentials path (`creds/token.json`, `creds/credentials.json`), scopes needed (`https://www.googleapis.com/auth/gmail.readonly`)
-- **Output:** rows inserted into `job_emails` with `confidence_score = NULL`, `classification_method = NULL`
+**Decision:** Raw email content (`raw_content` column) is never written to
+stdout, log files, or any output stream. It lives in the DB only.
 
----
+**Rationale:** Emails contain personal data — names, contact info, salary
+figures, sometimes credentials in attachments. Logs are the highest leak
+risk: they get pasted into chats, committed accidentally, sent to monitoring
+services. The DB is the one place this data lives, and access goes through
+explicit SQL.
 
-## Likely shape of Spec 03 (LLM classifier)
-
-Goal: for each unclassified email in `job_emails`, call Claude API to extract
-`company`, `role`, `stage`, `is_recruiter_inbound`, `calendar_invite_detected`,
-`confidence_score`, and write results back.
-
-Key decisions to resolve in spec:
-- **Prompt design:** what fields does the LLM extract? JSON schema for structured output.
-- **Batching:** one API call per email, or thread-level batching (all emails in a thread as context)?
-- **Confidence threshold:** 0.85 cutoff is defined in CLAUDE.md. Below threshold → what field/flag?
-- **Retry / error handling:** transient API errors vs. permanent failures
-- **Rate limiting:** Gmail returns up to ~500 messages; Claude API has TPM limits
-- **Thread rollup:** after classifying individual emails, update `job_threads` table
-- **classification_method value:** `llm_single` for per-email, `llm_thread` for thread-context calls
+**Implications:**
+- Logging in fetcher and classifier must explicitly redact body content.
+  Log message metadata only: `email_id`, `subject` truncated, `sender`,
+  classification result.
+- Error messages must not include raw body. Tracebacks that risk this
+  must be caught and re-raised with sanitized context.
+- Test fixtures use synthetic email bodies, never real ones.
 
 ---
 
-## Methodology reminders (from ~/.claude/methodology.md)
+## #007 — Read-only Gmail access (`gmail.readonly` scope)
 
-- Every task needs a spec before code is written. Spec is the contract.
-- One spec = one verifiable artifact (a file, a module, a test suite).
-- Subagents get: the spec + referenced instruction files + only needed input artifacts.
-- Agent must not guess. If uncertain → `TODO` comment + stop + escalate.
-- Max 2–3 correction iterations before escalating to human.
-- Human verification gate before declaring spec complete or moving to next spec.
+**Date:** 2026-XX-XX (planned for spec 02)
+**Status:** Active
+
+**Decision:** OAuth scope is `https://www.googleapis.com/auth/gmail.readonly`.
+We never modify, send, label, or delete in Gmail.
+
+**Rationale:** The pipeline is purely an observer of the inbox. Read-only
+scope means a bug in our code can't damage the user's actual mailbox — at
+worst, we have a wrong row in DuckDB, which is fixable. This also keeps the
+OAuth consent screen narrower and the threat surface smaller if credentials
+ever leak.
+
+**Implications:**
+- "Mark as read," "apply label," "auto-reply" — none of these are options
+  without a scope change, which is a deliberate decision, not a casual one.
+- If a future spec needs write access, it requires re-doing the OAuth
+  consent flow with broader scopes.
+
+---
+
+## #008 — Claude Haiku 4.5 as classifier, with Sonnet escalation hatch
+
+**Date:** 2026-05-06 (revised from earlier Sonnet-only choice)
+**Status:** Active
+
+**Decision:** Default classifier is Claude Haiku 4.5 (`claude-haiku-4-5`).
+Low-confidence classifications (below the threshold in #005) MAY be
+re-classified by Claude Sonnet 4.6 as an escalation path before falling
+through to manual review. Escalation path is not required for Phase 1 — it
+can be added in a later spec if Haiku alone produces too many low-confidence
+results.
+
+**Rationale:** Email classification is a structured extraction task —
+well-defined fields (company, role, stage, booleans), no multi-step reasoning
+required. This is the category Haiku 4.5 is explicitly positioned for, with
+quality matching the older Sonnet 4 at roughly one-third the cost
+($1/$5 per million tokens vs $3/$15 for Sonnet 4.6). Earlier choice of
+Sonnet 4 predated Haiku 4.5's release; revisiting now with the cheaper
+option as default. Sonnet stays available as an escalation tier so that
+ambiguous cases — where the marginal quality might tip a row above the
+confidence threshold — aren't immediately dumped on a human reviewer.
+
+**Implications:**
+- Model strings live in config (`.env` or a constants module), not hardcoded.
+  Both `CLASSIFIER_PRIMARY_MODEL` and `CLASSIFIER_ESCALATION_MODEL` so a swap
+  is one config edit.
+- Phase 1 implementation may use Haiku only and skip the escalation step —
+  that decision belongs in spec 03.
+- If Haiku quality on real emails is poor, the escape hatch is to flip the
+  default to Sonnet without code changes.
+- Cost projection: at ~5000 historical emails × ~2k tokens each, Haiku
+  classification of the full backfill costs roughly $10–$15. Sonnet would
+  cost ~$30–$45. Difference matters more for ongoing volume than for the
+  one-time backfill.
+
+---
+
+## #009 — `classification_method` enum splits regex / heuristic / llm_single / llm_thread / manual
+
+**Date:** 2026-XX-XX (during spec 01)
+**Status:** Active
+
+**Decision:** `classification_method_enum` has five values:
+- `regex` — deterministic pattern match
+- `heuristic` — non-LLM rule-based logic (e.g. sender domain rules)
+- `llm_single` — LLM classified the email in isolation
+- `llm_thread` — LLM classified the email with thread context
+- `manual` — human override
+
+**Rationale:** Tracking *how* a row was classified is essential for debugging
+and for prioritizing re-classification. If classifier prompts change, we want
+to re-run only `llm_single` and `llm_thread` rows, leaving `manual` and
+`regex` alone. Without this column, we'd have no way to identify which rows
+were touched by which version of the logic.
+
+**Implications:**
+- Manual overrides (a human editing a row) must set `classification_method
+  = 'manual'` so future automated runs skip them.
+- The split between `llm_single` and `llm_thread` is a real architectural
+  choice — see spec 03's design for whether we batch by thread or not.
+- Adding a new method (e.g. an embedding-based classifier later) means
+  adding to the enum, which is a schema migration.
+
+---
+
+## #010 — Dumb fetch + classifier filter
+
+**Date:** 2026-05-07 (planned for spec 02)
+**Status:** Active
+
+**Decision:** The fetcher does not attempt to filter for job-relatedness. It
+pulls every received Gmail message (Gmail query excludes only chats, sent,
+drafts, spam, and trash) and inserts each row with NULL classification fields.
+The classifier (spec 03) is the sole owner of the "is this job-related?"
+decision.
+
+**Rationale:** Smart filtering at fetch time — keyword-matching on subjects
+or sender lists — was considered and rejected. The failure mode is invisible:
+emails that should have been in the dataset get silently dropped, and there's
+no row to inspect later. Letting the classifier decide means false negatives
+exist as low-confidence rows we can review, rather than as missing rows we
+never knew about. The dumb fetch is only economically viable in combination
+with #011 (heuristics filter the obvious bulk before any LLM cost is paid).
+
+**Implications:**
+- The fetcher's only filter is the Gmail query string. No subject/sender
+  allowlists or denylists in fetcher code.
+- Every fetched row has `confidence_score = NULL` and
+  `classification_method = NULL` on insert.
+- Total `job_emails` row count after backfill will be much larger than the
+  count of actual job emails (likely 10–20× larger). DuckDB compresses well
+  and Phase 1 is single-user, so disk size is not a concern.
+- The classifier MUST handle the obviously-not-job case efficiently or LLM
+  cost balloons. That's what #011 exists for.
+
+---
+
+## #011 — Two-stage classification: Python heuristics, then Haiku LLM
+
+**Date:** 2026-05-07 (planned for spec 03; informs spec 02 scope)
+**Status:** Active
+
+**Decision:** Classification runs in two stages.
+
+- **Stage 1 — Heuristics:** Deterministic Python rules (sender-domain rules,
+  subject regexes) run on every NULL-confidence row. A stage-1 hit sets
+  `classification_method = 'heuristic'` and `confidence_score = 1.0`.
+- **Stage 2 — Haiku LLM:** Claude Haiku 4.5 (per #008) runs on rows still
+  NULL after stage 1. Sets `classification_method = 'llm_single'` (or
+  `'llm_thread'` per #009) with the LLM's self-reported confidence.
+
+Stage-1 rules are NOT designed in advance. They will be learned from real
+data after the spec-02 backfill via exploratory SQL (high-volume senders,
+common subject patterns that are obviously not job-related). Spec 03 is
+therefore blocked on spec 02 completion plus an exploratory pass.
+
+**Rationale:** Without stage 1, the LLM would have to look at every email —
+newsletters, GitHub notifications, calendar reminders, retail receipts. Those
+dominate the inbox by volume and are trivially identifiable by sender or
+subject. Heuristics eliminate this bulk for free, leaving the LLM to handle
+only the genuinely ambiguous cases. This is what makes the dumb fetch in
+#010 economically viable: cost scales with the ambiguous-fraction, not the
+total inbox size.
+
+**Implications:**
+- Spec 02 (fetcher) can proceed before stage-1 rules are designed.
+- Spec 03 has a mandatory prerequisite: exploratory SQL on the populated
+  DB to identify the heuristic ruleset. Without that, spec 03 cannot be
+  drafted with the same precision as spec 01.
+- The cost projection in #008 (~$10–$15 for ~5000 emails via Haiku) was
+  predicated on most rows being job-related. Under #010 + #011, the LLM
+  only sees the post-heuristic remainder — likely a much smaller set —
+  so the projection is conservative, not aggressive.
+- The `classification_method` enum (#009) already includes both
+  `'heuristic'` and `'llm_single'`, so no schema change is needed.
+- A row that scored confidence 1.0 via heuristics never gets re-examined by
+  the LLM unless explicitly re-classified.
