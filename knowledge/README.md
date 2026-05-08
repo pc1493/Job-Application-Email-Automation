@@ -15,7 +15,15 @@ when starting a similar project.
 
 ## Skill reference
 
-[skill.md](skill.md) — reusable patterns covering:
+`skill.md` was promoted to `~/.claude/python-pipeline-patterns.md` after
+spec 02. That file is now the single source of truth for reusable Python
+pipeline patterns and is referenced in every subsequent spec via:
+
+```
+@~/.claude/python-pipeline-patterns.md
+```
+
+Patterns covered (see that file for details):
 
 1. Dockerized Python environment (node:20 base)
 2. pytest PYTHONPATH configuration
